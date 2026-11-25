@@ -1,0 +1,163 @@
+# Darknode Code Scan: a composite action that runs the Darknode code scanner on the
+# runner and fails the check only on NEW findings at or above `fail-on`.
+# The scanner is pinned: it is downloaded from Darknode-Official/darknode-web at one
+# immutable commit and every file is checked against the SHA-256 below before it runs,
+# so the step fails closed if a single byte differs. scripts/pin.mjs re-pins it for
+# each release of this action.
+name: Darknode Code Scan
+description: Fail a pull request only on new high or critical findings from the Darknode code scanner. Your code never leaves the runner.
+author: Darknode-Official
+branding:
+  icon: shield
+  color: gray-dark
+
+inputs:
+  fail-on:
+    description: "Lowest severity of a new finding that fails the check: critical, high, medium, low, or none to report without failing."
+    required: false
+    default: high
+  path:
+    description: Folder to scan, relative to the workspace. A .darknodeignore at its root is honoured.
+    required: false
+    default: "."
+  sarif:
+    description: Upload results to GitHub code scanning. Needs the security-events write permission; private repositories also need GitHub Advanced Security. Set to false without it; the gate still works.
+    required: false
+    default: "true"
+  include-review:
+    description: Also upload needs-review items (a risky call with no traced untrusted input) to code scanning. They never fail the check.
+    required: false
+    default: "false"
+  diff:
+    description: Fail only on findings that are new since the pull request base, the merge queue base or the commit before a push. With no base (a new branch, a first push, other events) the whole folder is scanned and every finding at or above fail-on counts.
+    required: false
+    default: "true"
+  deps:
+    description: Check pinned dependencies in manifests and lockfiles against OSV.dev advisories. Sends package names and versions to api.osv.dev, never code.
+    required: false
+    default: "true"
+
+outputs:
+  critical:
+    description: Number of new critical findings (needs-review items not included).
+    value: ${{ steps.scan.outputs.critical }}
+  high:
+    description: Number of new high findings (needs-review items not included).
+    value: ${{ steps.scan.outputs.high }}
+  medium:
+    description: Number of new medium findings (needs-review items not included).
+    value: ${{ steps.scan.outputs.medium }}
+  low:
+    description: Number of new low findings (needs-review items not included).
+    value: ${{ steps.scan.outputs.low }}
+  needs-review:
+    description: Number of new needs-review items. They never fail the check.
+    value: ${{ steps.scan.outputs.needs-review }}
+  result:
+    description: "passed or failed. With fail-on: none it is always passed."
+    value: ${{ steps.scan.outputs.result }}
+  mode:
+    description: "diff when findings were compared with a base commit, full when the whole folder was scanned."
+    value: ${{ steps.scan.outputs.mode }}
+  sarif-file:
+    description: Absolute path of the SARIF file on the runner. It covers the whole folder when sarif is true, and only the changed files in diff mode when sarif is false.
+    value: ${{ steps.scan.outputs.sarif-file }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check for Node.js 20
+      id: node
+      shell: bash
+      run: |
+        if command -v node >/dev/null 2>&1 && node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 20 ? 0 : 1)'; then
+          echo "Using Node.js $(node --version) from the runner."
+          echo "install=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "No Node.js 20 or newer on PATH, so Node.js 20 will be installed."
+          echo "install=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Set up Node.js 20
+      if: steps.node.outputs.install == 'true'
+      uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      with:
+        node-version: "20"
+
+    - name: Download and verify the pinned Darknode scanner
+      id: scanner
+      shell: bash
+      env:
+        # pin:begin (written by scripts/pin.mjs; do not edit by hand)
+        DARKNODE_SCANNER_SHA: f5776cd4bf8e1c08588c9084454110e42a47a537
+        DARKNODE_SCANNER_SUMS: |
+          0b8964e7642eed9ba64d279d53e38d1f32852f723f942c29b4ec5086311e2b3e  codescan/rules.js
+          73db7b22871e534f41bac3bf3574c25d44be9ef8e10b7c133db7a940ef83756e  codescan/taint-js.js
+          c02ae8c891adb85c88702b38479dd1a162b191f11adb426aed5a95499d771510  codescan/baseline.js
+          b525bc51e0ee23c7aca3af69c6d33acb8775fa3d98b30d2caf33888eadf3f03c  codescan/github.js
+          4180c01dbcbd6970ac492ed7f0541825ba5c77da145d17619f6a244f9d2f5e89  codescan/cli.mjs
+          795a484f73e4296f3018b0bf888275b09281da1f165d6acbe521863a7558a1a0  core/secret-detectors.js
+          ff037c2d825a310aa34a21a8223b1c52facf1692b97f26c2fe975731da87e05d  core/lockfiles.js
+        # pin:end
+      run: |
+        set -euo pipefail
+        fail() { echo "::error title=Darknode scan::$1 The scanner was not run."; exit 1; }
+        [[ "$DARKNODE_SCANNER_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "The scanner pin is not a full commit SHA."
+        if command -v sha256sum >/dev/null 2>&1; then sum() { sha256sum "$1" | cut -d' ' -f1; }; else sum() { shasum -a 256 "$1" | cut -d' ' -f1; }; fi
+        d="$(mktemp -d "$RUNNER_TEMP/darknode-scan.XXXXXX")"
+        echo '{"type":"module"}' > "$d/package.json"
+        n=0
+        while read -r want file rest; do
+          [ -z "$want" ] && continue
+          if ! [[ "$want" =~ ^[0-9a-f]{64}$ && "$file" =~ ^[A-Za-z0-9][A-Za-z0-9/_.-]*$ && "$file" != *..* && -z "$rest" ]]; then
+            fail "Malformed scanner pin line: $want $file $rest."
+          fi
+          url="https://raw.githubusercontent.com/Darknode-Official/darknode-web/$DARKNODE_SCANNER_SHA/public/js/$file"
+          curl -fsSL --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 --create-dirs -o "$d/$file" "$url" || fail "Could not download $file."
+          got="$(sum "$d/$file")"
+          [ "$got" = "$want" ] || fail "Checksum mismatch for $file: expected $want, got $got."
+          echo "verified  $got  $file"
+          n=$((n + 1))
+        done <<< "$DARKNODE_SCANNER_SUMS"
+        if [ "$n" -eq 0 ] || [ ! -f "$d/codescan/cli.mjs" ]; then fail "The scanner pin lists no files or no codescan/cli.mjs."; fi
+        echo "Scanner: Darknode-Official/darknode-web@$DARKNODE_SCANNER_SHA, $n files verified."
+        echo "dir=$d" >> "$GITHUB_OUTPUT"
+        echo "sha=$DARKNODE_SCANNER_SHA" >> "$GITHUB_OUTPUT"
+
+    - name: Scan
+      id: scan
+      shell: bash
+      env:
+        DARKNODE_SCANNER_DIR: ${{ steps.scanner.outputs.dir }}
+        DARKNODE_SCANNER_SHA: ${{ steps.scanner.outputs.sha }}
+        DN_FAIL_ON: ${{ inputs.fail-on }}
+        DN_PATH: ${{ inputs.path }}
+        DN_SARIF: ${{ inputs.sarif }}
+        DN_INCLUDE_REVIEW: ${{ inputs.include-review }}
+        DN_DIFF: ${{ inputs.diff }}
+        DN_DEPS: ${{ inputs.deps }}
+        DN_PR_BASE: ${{ github.event.pull_request.base.sha }}
+        DN_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        DN_MQ_BASE: ${{ github.event.merge_group.base_sha }}
+        DN_PUSH_BEFORE: ${{ github.event.before }}
+      run: node "$GITHUB_ACTION_PATH/scripts/run.mjs"
+
+    - name: Upload results to GitHub code scanning
+      if: steps.scan.outputs.upload == 'true'
+      uses: github/codeql-action/upload-sarif@915412ff23e8b7659517e607487dbeae018f2934 # v4.39.5
+      with:
+        sarif_file: ${{ steps.scan.outputs.sarif-file }}
+        category: ${{ steps.scan.outputs.category }}
+
+    - name: Gate
+      shell: bash
+      env:
+        DN_RESULT: ${{ steps.scan.outputs.result }}
+        DN_GATING: ${{ steps.scan.outputs.gating }}
+        DN_FAIL_ON: ${{ inputs.fail-on }}
+      run: |
+        if [ "$DN_RESULT" = "failed" ]; then
+          echo "::error title=Darknode scan::Gate failed: $DN_GATING new finding(s) at $DN_FAIL_ON or above. The job summary lists them."
+          exit 1
+        fi
+        echo "Gate passed (fail-on: $DN_FAIL_ON)."
