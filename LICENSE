@@ -1,0 +1,39 @@
+Darknode Scan Action: Source-Available License
+
+Copyright (c) 2026 Darknode-Official. All rights reserved.
+
+This repository is source-available. It is NOT open source, and no
+open-source licence applies to it or to the scanner it runs.
+
+PERMITTED:
+- Referencing this Action from a GitHub Actions workflow
+  (uses: Darknode-Official/scan-action@<ref>) to scan repositories you
+  own or are authorised to scan, and running it, unmodified, on
+  GitHub-hosted or self-hosted runners for that purpose.
+- Reading the source to review what the Action does.
+
+THE DARKNODE CODE SCANNER:
+At run time the Action downloads the Darknode Code Scanner from
+https://github.com/Darknode-Official/darknode-web at one pinned commit
+and checks every file against a SHA-256 recorded in action.yml. Those
+files are covered by the darknode-web LICENSE. Running them, unmodified,
+through this Action as described under PERMITTED is allowed. No other
+right in them is granted.
+
+PROHIBITED:
+- Copying, mirroring or redistributing this repository, the Action or
+  the scanner files, in whole or in part.
+- Modifying the Action or the scanner, running a modified version, or
+  creating derivative works.
+- Offering the Action or the scanner as, or as part of, a hosted product
+  or service.
+- Removing, altering or circumventing licence notices, copyright headers
+  or the checksum verification.
+
+Nothing in this licence limits the rights that GitHub's Terms of Service
+give users of public repositories on GitHub.
+
+This software is provided "as is", without warranty of any kind, express
+or implied.
+
+For licensing inquiries: contact@darknode.ai
