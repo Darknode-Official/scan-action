@@ -1,0 +1,151 @@
+# Self-test: runs this action from the checkout (uses: ./) against the fixtures in
+# selftest/ and asserts each outcome. selftest/vulnerable is deliberately vulnerable.
+name: Self-test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: self-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cases:
+    name: Gate cases (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "Case 1: planted critical finding (expected: gate fails)"
+        id: vulnerable
+        continue-on-error: true
+        uses: ./
+        with:
+          path: selftest/vulnerable
+          diff: "false"
+          sarif: "false"
+
+      - name: "Assert case 1"
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.vulnerable.outcome }}
+          RESULT: ${{ steps.vulnerable.outputs.result }}
+          CRITICAL: ${{ steps.vulnerable.outputs.critical }}
+          SARIF: ${{ steps.vulnerable.outputs.sarif-file }}
+        run: |
+          fail() { echo "::error title=Self-test::FAIL case 1: $1"; exit 1; }
+          echo "outcome=$OUTCOME result=$RESULT critical=$CRITICAL sarif=$SARIF"
+          [ "$OUTCOME" = "failure" ] || fail "the action should have failed, outcome was $OUTCOME"
+          [ "$RESULT" = "failed" ] || fail "result output should be failed, was '$RESULT'"
+          [ "${CRITICAL:-0}" -ge 1 ] || fail "expected at least one critical finding, got '$CRITICAL'"
+          grep -q '"ruleId": "js.taint.cmd"' "$SARIF" || fail "SARIF has no js.taint.cmd result"
+          grep -q '"uri": "selftest/vulnerable/server.js"' "$SARIF" || fail "SARIF location is not relative to the repository root"
+          echo "PASS case 1: the planted command injection failed the gate ($CRITICAL critical)."
+
+      - name: "Case 2: clean code (expected: gate passes)"
+        id: clean
+        continue-on-error: true
+        uses: ./
+        with:
+          path: selftest/clean
+          diff: "false"
+          sarif: "false"
+
+      - name: "Assert case 2"
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.clean.outcome }}
+          RESULT: ${{ steps.clean.outputs.result }}
+          COUNTS: ${{ steps.clean.outputs.critical }}/${{ steps.clean.outputs.high }}/${{ steps.clean.outputs.medium }}/${{ steps.clean.outputs.low }}
+        run: |
+          fail() { echo "::error title=Self-test::FAIL case 2: $1"; exit 1; }
+          echo "outcome=$OUTCOME result=$RESULT critical/high/medium/low=$COUNTS"
+          [ "$OUTCOME" = "success" ] || fail "the action should have passed, outcome was $OUTCOME"
+          [ "$RESULT" = "passed" ] || fail "result output should be passed, was '$RESULT'"
+          [ "$COUNTS" = "0/0/0/0" ] || fail "expected no findings, got $COUNTS"
+          echo "PASS case 2: clean code passed the gate with no findings."
+
+      - name: "Case 3 setup: copy the action and change one pinned hash"
+        shell: bash
+        run: |
+          mkdir -p .tampered
+          cp -R action.yml scripts .tampered/
+          node -e '
+            const fs = require("fs"), p = ".tampered/action.yml", s = fs.readFileSync(p, "utf8");
+            const m = /^( +)([0-9a-f]{64})(  codescan\/rules\.js)$/m.exec(s);
+            if (!m) { console.log("pinned hash for codescan/rules.js not found"); process.exit(1); }
+            const bad = (m[2][0] === "0" ? "1" : "0") + m[2].slice(1);
+            fs.writeFileSync(p, s.replace(m[0], m[1] + bad + m[3]));
+            console.log("codescan/rules.js pin changed from " + m[2] + " to " + bad);
+          '
+
+      - name: "Case 3: tampered pin (expected: fails closed before scanning)"
+        id: tampered
+        continue-on-error: true
+        uses: ./.tampered
+        with:
+          path: selftest/clean
+          diff: "false"
+          sarif: "false"
+
+      - name: "Assert case 3"
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.tampered.outcome }}
+          RESULT: ${{ steps.tampered.outputs.result }}
+        run: |
+          fail() { echo "::error title=Self-test::FAIL case 3: $1"; exit 1; }
+          echo "outcome=$OUTCOME result='$RESULT'"
+          [ "$OUTCOME" = "failure" ] || fail "a wrong pinned hash must fail the action, outcome was $OUTCOME"
+          [ -z "$RESULT" ] || fail "the scanner ran despite the wrong hash (result '$RESULT')"
+          echo "PASS case 3: the wrong hash stopped the action before the scanner ran."
+
+  whole-repo:
+    name: Whole repository, default inputs
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "Case 4: default inputs on this repository (expected: passes, SARIF uploaded)"
+        id: repo
+        continue-on-error: true
+        uses: ./
+
+      - name: "Assert case 4"
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.repo.outcome }}
+          RESULT: ${{ steps.repo.outputs.result }}
+          MODE: ${{ steps.repo.outputs.mode }}
+          SARIF: ${{ steps.repo.outputs.sarif-file }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          fail() { echo "::error title=Self-test::FAIL case 4: $1"; exit 1; }
+          echo "outcome=$OUTCOME result=$RESULT mode=$MODE sarif=$SARIF"
+          [ "$OUTCOME" = "success" ] || fail "the action should have passed, outcome was $OUTCOME"
+          [ "$RESULT" = "passed" ] || fail "result output should be passed, was '$RESULT'"
+          [ -s "$SARIF" ] || fail "no SARIF file at '$SARIF'"
+          if [ "$EVENT" = "pull_request" ]; then [ "$MODE" = "diff" ] || fail "a pull request should be diffed against its base, mode was $MODE"; fi
+          echo "PASS case 4: default inputs passed ($MODE mode); .darknodeignore kept the planted fixture out and the SARIF upload ran."
